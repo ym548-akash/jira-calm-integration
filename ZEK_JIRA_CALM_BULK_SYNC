@@ -1,0 +1,445 @@
+*&---------------------------------------------------------------------*
+*& Report ZEK_JIRA_CALM_INTEGRATION
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zek_jira_calm_bulk_sync.
+
+*--- Input Parameters
+*PARAMETERS: p_jkey TYPE char20 OBLIGATORY, " Jira Issue Key
+*            p_proj TYPE string DEFAULT '811678b6-079b-4bff-a9c5-e802bf904b12'. " CALM Project GUID
+
+
+*----------------------------------------------------------------------*
+CLASS lcl_jira_to_calm DEFINITION.
+  PUBLIC SECTION.
+    METHODS execute." IMPORTING iv_jira_key TYPE char20 iv_calm_proj TYPE string.
+  PRIVATE SECTION.
+    TYPES: BEGIN OF ty_jira_priority,
+             id TYPE string,
+           END OF ty_jira_priority,
+
+*            begin of ty_jira_statusCategory,
+*             name type char40,
+*           end of ty_jira_statusCategory,
+
+           BEGIN OF ty_jira_status,
+             "statusCategory type ty_jira_statusCategory,
+             name TYPE char40,
+           END OF ty_jira_status,
+
+           BEGIN OF ty_jira_fields,
+*             summary           TYPE string,
+*             created           TYPE string,
+*             duedate           TYPE string,
+*             description       TYPE string,
+*             priority          TYPE ty_jira_priority,
+*             customfield_12127 TYPE string,
+             status TYPE ty_jira_status,
+           END OF ty_jira_fields,
+
+           BEGIN OF ty_jira_issues,
+             key    TYPE char20,
+             fields TYPE ty_jira_fields,
+           END OF ty_jira_issues,
+
+           tt_jira_issues TYPE STANDARD TABLE OF ty_jira_issues WITH EMPTY KEY,
+
+           BEGIN OF ty_jira_search,
+             issues TYPE tt_jira_issues,
+             total  TYPE i,
+           END OF ty_jira_search.
+
+    TYPES: BEGIN OF ty_calm_payload,
+             projectId   TYPE string,
+             title       TYPE string,
+             type        TYPE string,
+             source      TYPE string,
+             externalId  TYPE string,
+             startDate   TYPE string,
+             dueDate     TYPE string,
+             priorityId  TYPE i,
+             description TYPE string,
+             workstream  TYPE string,
+           END OF ty_calm_payload.
+
+    TYPES: BEGIN OF ty_oauth_response,
+             access_token TYPE string,
+             token_type   TYPE string,
+             expires_in   TYPE i,
+           END OF ty_oauth_response.
+
+
+    TYPES: BEGIN OF ty_calm_create_resp,
+             id TYPE char50,
+           END OF ty_calm_create_resp.
+
+    TYPES : BEGIN OF ty_jira_status_updates,
+              jira_key TYPE char20,
+              calm_id  TYPE char50,
+              status   TYPE char40,
+            END OF ty_jira_status_updates,
+            tt_jira_status_updates TYPE STANDARD TABLE OF ty_jira_status_updates WITH EMPTY KEY.
+
+    DATA: gv_jira_status TYPE char40.
+
+    METHODS fetch_jira_updates RETURNING VALUE(rv_payload) TYPE string.
+    METHODS transform_jira
+      IMPORTING iv_jira_payload                    TYPE string
+      RETURNING VALUE(rt_jira_calm_status_updates) TYPE tt_jira_status_updates.
+    METHODS get_btp_token RETURNING VALUE(rv_token) TYPE string.
+    METHODS update_log
+      IMPORTING
+        iv_jira_key    TYPE char20
+        iv_calm_id     TYPE char50
+        iv_jira_status TYPE char40.
+    METHODS update_calm_status
+      IMPORTING iv_token        TYPE string
+                iv_calm_task_id TYPE char50
+                iv_jira_status  TYPE char40.
+ENDCLASS.
+
+CLASS lcl_jira_to_calm IMPLEMENTATION.
+
+  METHOD execute.
+
+    "Fetch BTP Token for CALM API
+    DATA(lv_token) = get_btp_token( ).
+
+    "Fetch JIRA ticket
+    DATA(lv_jira_payload) = fetch_jira_updates( ).
+
+    "Handle API failures
+    IF lv_jira_payload = 'ERROR'.
+      MESSAGE 'Failed to fetch data from JIRA' TYPE 'E'.
+      RETURN.
+    ENDIF.
+
+    "Transform the payload into bugs that need to be updated to CALM
+    DATA(lt_jira_status_updates) = transform_jira( iv_jira_payload = lv_jira_payload ).
+
+    IF lv_token IS NOT INITIAL.
+
+      LOOP AT lt_jira_status_updates ASSIGNING FIELD-SYMBOL(<lfs_jira_status_updates>).
+
+        update_calm_status( iv_token = lv_token
+                                iv_calm_task_id = <lfs_jira_status_updates>-calm_id
+                                iv_jira_status = <lfs_jira_status_updates>-status ).
+
+        update_log(
+                    iv_jira_key    = <lfs_jira_status_updates>-jira_key
+                    iv_calm_id     = <lfs_jira_status_updates>-calm_id
+                    iv_jira_status = <lfs_jira_status_updates>-status ).
+
+      ENDLOOP.
+
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD get_btp_token.
+    " Implementation for: https://yamaha-motor-eu.authentication.eu10.hana.ondemand.com
+    DATA: lo_http_client   TYPE REF TO if_http_client,
+          lv_client_id     TYPE string VALUE 'sb-sap-cloud-alm-api!b599280|sapcloudalm-ext-01!b16907',
+          lv_client_secret TYPE string VALUE 'add8197e-7fd7-4e52-b248-1c3b213605e7$b_BeJ3sJeA0MoFEeBLOyqiJKpRRZ_-UAYvbze6S6Jbk=',
+          lv_body          TYPE string,
+          lv_status        TYPE i,
+          lv_response      TYPE string,
+          ls_token         TYPE ty_oauth_response.
+    cl_http_client=>create_by_url( EXPORTING url = 'https://yamaha-motor-eu.authentication.eu10.hana.ondemand.com/oauth/token'
+                                   IMPORTING client = lo_http_client ).
+
+    cl_http_client=>create_by_url(
+   EXPORTING
+     url    = 'https://yamaha-motor-eu.authentication.eu10.hana.ondemand.com/oauth/token'
+   IMPORTING
+     client = lo_http_client ).
+
+    lo_http_client->request->set_method( if_http_request=>co_request_method_post ).
+    lo_http_client->request->set_header_field(
+      name  = 'Content-Type'
+      value = 'application/x-www-form-urlencoded' ).
+
+    lv_body =
+      |grant_type=client_credentials&client_id={ lv_client_id }&client_secret={ lv_client_secret }|.
+
+    lo_http_client->request->set_cdata( lv_body ).
+
+    lo_http_client->send( ).
+    lo_http_client->receive( ).
+
+    lo_http_client->response->get_status( IMPORTING code = lv_status ).
+
+    IF lv_status <> 200.
+      RETURN.
+    ENDIF.
+
+    lv_response = lo_http_client->response->get_cdata( ).
+
+    " Proper JSON parsing
+    /ui2/cl_json=>deserialize(
+      EXPORTING
+        json = lv_response
+      CHANGING
+        data = ls_token ).
+
+    rv_token = ls_token-access_token.
+
+  ENDMETHOD.
+
+  METHOD fetch_jira_updates.
+
+    DATA: lo_http_client TYPE REF TO if_http_client,
+          lv_url         TYPE string,
+          lv_auth        TYPE string,
+          lv_status      TYPE i,
+          lv_payload     TYPE string.
+
+    " Build Jira issue URL
+    lv_url = |https://support.yamnet.com/rest/api/2/search|.
+
+    " Create HTTP client
+    cl_http_client=>create_by_url(
+      EXPORTING
+        url                = lv_url
+        proxy_host =  'proxy'
+        proxy_service = '3128'
+      IMPORTING
+        client             = lo_http_client
+      EXCEPTIONS
+        argument_not_found = 1
+        plugin_not_active  = 2
+        internal_error     = 3
+        OTHERS             = 4 ).
+
+    IF sy-subrc <> 0.
+      rv_payload = 'ERROR'.
+      RETURN.
+    ENDIF.
+
+    " ---------- Authentication ----------
+    lv_auth = cl_http_utility=>encode_base64( 'hchandra@yamaha-motor-india.com:Harshvardh@0o8' ).
+
+    lo_http_client->request->set_header_field(
+      name  = 'Authorization'
+      value = |Basic { lv_auth }| ).
+
+    lo_http_client->request->set_header_field(
+      name  = 'Accept'
+      value = 'application/json' ).
+
+    lo_http_client->request->set_method( if_http_request=>co_request_method_post ).
+
+    lv_payload = '{ "jql": "project = YIS AND issuetype = Bug AND updated >= \"2026-01-27 00:00\" ORDER BY updated ASC", "startAt": 0, "maxResults": 50, "fields": ["status"] }'.
+
+    lo_http_client->request->set_cdata( lv_payload ).
+
+    lo_http_client->request->set_header_field(
+      name  = 'Content-Type'
+      value = 'application/json' ).
+
+
+    " ---------- Send Request ----------
+    lo_http_client->send(
+      EXCEPTIONS
+        http_communication_failure = 1
+        http_invalid_state         = 2
+        http_processing_failed     = 3
+        OTHERS                     = 4 ).
+
+    IF sy-subrc <> 0.
+      rv_payload = 'ERROR'.
+      RETURN.
+    ENDIF.
+
+    " ---------- Receive Response ----------
+    lo_http_client->receive(
+      EXCEPTIONS
+        http_communication_failure = 1
+        http_invalid_state         = 2
+        http_processing_failed     = 3
+        OTHERS                     = 4 ).
+
+    IF sy-subrc <> 0.
+      rv_payload = 'ERROR'.
+      RETURN.
+    ENDIF.
+
+    " ---------- Status Code ----------
+    lo_http_client->response->get_status(
+      IMPORTING
+        code = lv_status ).
+
+    IF lv_status <> 200.
+*      rv_payload = |HTTP Error { lv_status }: { lo_http_client->response->get_cdata( ) }|.
+      rv_payload = 'ERROR'.
+      RETURN.
+    ENDIF.
+
+    " ---------- Response Payload ----------
+    rv_payload = lo_http_client->response->get_cdata( ).
+
+    " Cleanup
+    lo_http_client->close( ).
+
+  ENDMETHOD.
+
+  METHOD transform_jira.
+
+    DATA: ls_jira                TYPE ty_jira_search,
+          ls_calm                TYPE ty_calm_payload,
+          lv_priority            TYPE i,
+          lt_name_map            TYPE /ui2/cl_json=>name_mappings,
+          lt_jira_status_updates TYPE STANDARD TABLE OF ty_jira_status_updates.
+
+    " 1. Deserialize Jira JSON
+    /ui2/cl_json=>deserialize(
+      EXPORTING
+        json = iv_jira_payload
+      CHANGING
+        data = ls_jira ).
+
+    DATA(lt_issues) = ls_jira-issues.
+    DATA(lv_count) = ls_jira-total.
+
+
+    IF lt_issues IS NOT INITIAL.
+      SELECT * FROM zekt_jira_calm INTO TABLE @DATA(lt_jira_calm)
+        FOR ALL ENTRIES IN @lt_issues
+        WHERE jira_key = @lt_issues-key
+        AND last_jira_status <>  @lt_issues-fields-status-name.
+
+      LOOP AT lt_jira_calm ASSIGNING FIELD-SYMBOL(<lfs_jira_calm>).
+        APPEND INITIAL LINE TO lt_jira_status_updates ASSIGNING FIELD-SYMBOL(<lfs_jira_status_updates>).
+        <lfs_jira_status_updates>-calm_id = <lfs_jira_calm>-calm_task_id.
+        <lfs_jira_status_updates>-jira_key = <lfs_jira_calm>-jira_key.
+        <lfs_jira_status_updates>-status = lt_issues[ key = <lfs_jira_calm>-jira_key ]-fields-status-name.
+      ENDLOOP.
+
+    ENDIF.
+
+    RETURN lt_jira_status_updates.
+
+  ENDMETHOD.
+
+
+  METHOD update_log.
+    DATA: ls_log TYPE zekt_jira_calm,
+          lv_ts  TYPE timestampl.
+
+    GET TIME STAMP FIELD lv_ts.
+
+    SELECT SINGLE * FROM zekt_jira_calm
+      INTO ls_log
+      WHERE jira_key = iv_jira_key.
+
+    IF sy-subrc = 0.
+      ls_log-last_jira_status = iv_jira_status.
+      ls_log-last_sync_ts     = lv_ts.
+      MODIFY zekt_jira_calm FROM ls_log.
+    ELSE.
+      ls_log-mandt            = sy-mandt.
+      ls_log-jira_key         = iv_jira_key.
+      ls_log-calm_task_id     = iv_calm_id.
+      ls_log-last_jira_status = iv_jira_status.
+      ls_log-last_sync_ts     = lv_ts.
+      INSERT zekt_jira_calm FROM ls_log.
+    ENDIF.
+
+    COMMIT WORK.
+
+  ENDMETHOD.
+
+  METHOD update_calm_status.
+
+    DATA: lo_client    TYPE REF TO if_http_client,
+          lv_url       TYPE string,
+          lv_payload   TYPE string,
+          lv_response  TYPE string,
+          lv_substatus TYPE string,
+          lv_status    TYPE i,
+          lt_name_map  TYPE /ui2/cl_json=>name_mappings.
+
+    TYPES: BEGIN OF ty_calm_patch,
+             subStatus TYPE string,
+           END OF ty_calm_patch.
+
+    DATA ls_payload TYPE ty_calm_patch.
+
+    "-------------------------------
+    " Map JIRA status → CALM subStatus
+    "-------------------------------
+    CASE iv_jira_status.
+      WHEN 'Open' OR 'New'.
+        lv_substatus = 'DFC_NEW'.
+
+      WHEN 'In Progress' or 'Validation'.
+        lv_substatus = 'DFC_INP'.
+
+      WHEN 'Blocked' OR 'On Hold'.
+        lv_substatus = 'DFC_POSTPONE'.
+
+      WHEN 'Reopened' OR 'QA Failed'.
+        lv_substatus = 'DFC_RETEST_REQ'.
+
+      WHEN 'Done' OR 'Closed' OR 'Resolved'.
+        lv_substatus = 'DFC_CLOSED'.
+
+      WHEN OTHERS.
+        RETURN.
+    ENDCASE.
+
+    "-------------------------------
+    " Build JSON payload
+    "-------------------------------
+    ls_payload-subStatus = lv_substatus.
+
+    lt_name_map = VALUE #(
+        ( abap = 'SUBSTATUS'   json = 'subStatus'   )
+    ).
+
+    /ui2/cl_json=>serialize(
+      EXPORTING
+        data   = ls_payload
+        name_mappings = lt_name_map
+      RECEIVING
+        r_json = lv_payload
+    ).
+
+    "-------------------------------
+    " CALM PATCH URL
+    "-------------------------------
+    lv_url = |https://yamaha-motor-eu.eu10-004.alm.cloud.sap/api/calm-tasks/v1/tasks/{ iv_calm_task_id }|.
+
+    cl_http_client=>create_by_url(
+      EXPORTING
+        url    = lv_url
+      IMPORTING
+        client = lo_client
+    ).
+
+    lo_client->request->set_method( 'PATCH' ).
+    lo_client->request->set_header_field( name = 'Authorization' value = |Bearer { iv_token }| ).
+    lo_client->request->set_header_field( name = 'Content-Type' value = 'application/json' ).
+    lo_client->request->set_cdata( lv_payload ).
+
+    lo_client->send( ).
+    lo_client->receive( ).
+
+    lo_client->response->get_status( IMPORTING code = lv_status ).
+    lv_response = lo_client->response->get_cdata( ).
+
+    " Optional: log failures
+    IF lv_status <> 200 AND lv_status <> 204.
+      MESSAGE 'Updation failed!' TYPE 'E'.
+      RETURN.
+    ENDIF.
+
+  ENDMETHOD.
+
+
+ENDCLASS.
+
+
+START-OF-SELECTION.
+  DATA(lo_sync) = NEW lcl_jira_to_calm( ).
+  lo_sync->execute(  ).
